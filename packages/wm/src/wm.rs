@@ -1,4 +1,3 @@
-use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use tokio::sync::mpsc::{self};
 use tracing::warn;
@@ -54,9 +53,8 @@ pub struct WindowManager {
   pub event_rx: mpsc::UnboundedReceiver<WmEvent>,
   pub exit_rx: mpsc::UnboundedReceiver<()>,
   pub state: WmState,
-
-  // 🔥 DEBOUNCE STATE
-  last_retile: Instant,
+  
+  last_retile: std::time::Instant,
   retile_pending: bool,
 }
 
@@ -75,10 +73,8 @@ impl WindowManager {
       event_rx,
       exit_rx,
       state,
-
-      // 🔥 INIT DEBOUNCE
-      last_retile: Instant::now(),
-      retile_pending: false,
+	  last_retile: std::time::Instant::now(),
+	  retile_pending: false,
     })
   }
 
@@ -94,6 +90,7 @@ impl WindowManager {
         handle_display_settings_changed(state, config)
       }
       PlatformEvent::Keybinding(keybinding_event) => {
+        // Find the keybinding config that matches this keybinding.
         let commands = config
           .active_keybinding_configs(
             &self.state.binding_modes,
@@ -108,6 +105,7 @@ impl WindowManager {
           self.process_commands(&commands, None, config)?;
         }
 
+        // Return early since we don't want to redraw twice.
         return Ok(());
       }
       PlatformEvent::Mouse(event) => {
@@ -150,31 +148,693 @@ impl WindowManager {
       },
     }?;
 
-    // 🔥 DEBOUNCED SYNC
-    if !state.is_paused && state.pending_sync.has_changes() {
-      const RETILE_DELAY: Duration = Duration::from_millis(200);
+    // 🔥 debounce retile
+if !state.is_paused && state.pending_sync.has_changes() {
+  const RETILE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
-      if self.last_retile.elapsed() >= RETILE_DELAY {
-        platform_sync(state, config)?;
-        self.last_retile = Instant::now();
-        self.retile_pending = false;
-      } else {
-        self.retile_pending = true;
-      }
-    }
+  if self.last_retile.elapsed() >= RETILE_DELAY {
+    platform_sync(state, config)?;
+    self.last_retile = std::time::Instant::now();
+    self.retile_pending = false;
+  } else {
+    self.retile_pending = true;
+  }
+}
 
-    // 🔥 RUN DEFERRED SYNC
-    if self.retile_pending {
-      const RETILE_DELAY: Duration = Duration::from_millis(200);
+// 🔥 run delayed retile
+if self.retile_pending {
+  const RETILE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
-      if self.last_retile.elapsed() >= RETILE_DELAY {
-        platform_sync(state, config)?;
-        self.last_retile = Instant::now();
-        self.retile_pending = false;
-      }
-    }
+  if self.last_retile.elapsed() >= RETILE_DELAY {
+    platform_sync(state, config)?;
+    self.last_retile = std::time::Instant::now();
+    self.retile_pending = false;
+  }
+}
 
     Ok(())
   }
 
-  // ⛔ EVERYTHING BELOW UNCHANGED
+  pub fn process_commands(
+    &mut self,
+    commands: &Vec<InvokeCommand>,
+    subject_container_id: Option<Uuid>,
+    config: &mut UserConfig,
+  ) -> anyhow::Result<Uuid> {
+    let state = &mut self.state;
+
+    // Get the container to run WM commands with.
+    let subject_container = match subject_container_id {
+      Some(id) => state.container_by_id(id).with_context(|| {
+        format!("No container found with the given ID '{id}'.")
+      })?,
+      None => state
+        .focused_container()
+        .context("No subject container for command.")?,
+    };
+
+    let new_subject_container_id = WindowManager::run_commands(
+      commands,
+      subject_container,
+      state,
+      config,
+    )?;
+
+    if state.pending_sync.has_changes() {
+      platform_sync(state, config)?;
+    }
+
+    Ok(new_subject_container_id)
+  }
+
+  pub fn run_commands(
+    commands: &Vec<InvokeCommand>,
+    subject_container: Container,
+    state: &mut WmState,
+    config: &mut UserConfig,
+  ) -> anyhow::Result<Uuid> {
+    let mut current_subject_container = subject_container;
+
+    for command in commands {
+      WindowManager::run_command(
+        command,
+        current_subject_container.clone(),
+        state,
+        config,
+      )?;
+
+      // Update the subject container in case the container type changes.
+      // For example, when going from a tiling to a floating window.
+      current_subject_container =
+        if current_subject_container.is_detached() {
+          match state.container_by_id(current_subject_container.id()) {
+            Some(container) => container,
+            None => break,
+          }
+        } else {
+          current_subject_container
+        }
+    }
+
+    Ok(current_subject_container.id())
+  }
+
+  #[allow(clippy::too_many_lines)]
+  pub fn run_command(
+    command: &InvokeCommand,
+    subject_container: Container,
+    state: &mut WmState,
+    config: &mut UserConfig,
+  ) -> anyhow::Result<()> {
+    // No-op if WM is currently paused.
+    if state.is_paused && *command != InvokeCommand::WmTogglePause {
+      return Ok(());
+    }
+
+    if subject_container.is_detached() {
+      bail!("Cannot run command because subject container is detached.");
+    }
+
+    match &command {
+      InvokeCommand::AdjustBorders(args) => {
+        match subject_container.as_window_container() {
+          Ok(window) => {
+            let args = args.clone();
+            let border_delta = RectDelta::new(
+              args.left.unwrap_or(LengthValue::from_px(0)),
+              args.top.unwrap_or(LengthValue::from_px(0)),
+              args.right.unwrap_or(LengthValue::from_px(0)),
+              args.bottom.unwrap_or(LengthValue::from_px(0)),
+            );
+
+            window.set_border_delta(border_delta);
+            state.pending_sync.queue_container_to_redraw(window);
+
+            Ok(())
+          }
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::Close => {
+        match subject_container.as_window_container() {
+          Ok(window) => {
+            // Window handle might no longer be valid here.
+            if let Err(err) = window.native().close() {
+              warn!("Failed to close window: {:?}", err);
+            }
+
+            Ok(())
+          }
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::Focus(args) => {
+        if let Some(direction) = &args.direction {
+          focus_in_direction(&subject_container, direction, state)?;
+        }
+
+        if let Some(direction) = &args.workspace_in_direction {
+          focus_workspace(
+            WorkspaceTarget::Direction(direction.clone()),
+            state,
+            config,
+          )?;
+        }
+
+        if let Some(container_id) = &args.container_id {
+          focus_container_by_id(container_id, state)?;
+        }
+
+        if let Some(name) = &args.workspace {
+          focus_workspace(
+            WorkspaceTarget::Name(name.clone()),
+            state,
+            config,
+          )?;
+        }
+
+        if let Some(monitor_index) = &args.monitor {
+          focus_monitor(*monitor_index, state, config)?;
+        }
+
+        if args.next_active_workspace {
+          focus_workspace(WorkspaceTarget::NextActive, state, config)?;
+        }
+
+        if args.prev_active_workspace {
+          focus_workspace(WorkspaceTarget::PreviousActive, state, config)?;
+        }
+
+        if args.next_workspace {
+          focus_workspace(WorkspaceTarget::Next, state, config)?;
+        }
+
+        if args.prev_workspace {
+          focus_workspace(WorkspaceTarget::Previous, state, config)?;
+        }
+
+        if args.recent_workspace {
+          focus_workspace(WorkspaceTarget::Recent, state, config)?;
+        }
+
+        if args.next_active_workspace_on_monitor {
+          focus_workspace(
+            WorkspaceTarget::NextActiveInMonitor,
+            state,
+            config,
+          )?;
+        }
+
+        if args.prev_active_workspace_on_monitor {
+          focus_workspace(
+            WorkspaceTarget::PreviousActiveInMonitor,
+            state,
+            config,
+          )?;
+        }
+
+        Ok(())
+      }
+      InvokeCommand::Ignore => {
+        match subject_container.as_window_container() {
+          Ok(window) => ignore_window(window, state),
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::Move(args) => {
+        match subject_container.as_window_container() {
+          Ok(window) => {
+            if let Some(direction) = &args.direction {
+              move_window_in_direction(
+                window.clone(),
+                direction,
+                state,
+                config,
+              )?;
+            }
+
+            if let Some(direction) = &args.workspace_in_direction {
+              move_window_to_workspace(
+                window.clone(),
+                WorkspaceTarget::Direction(direction.clone()),
+                state,
+                config,
+              )?;
+            }
+
+            if let Some(name) = &args.workspace {
+              move_window_to_workspace(
+                window.clone(),
+                WorkspaceTarget::Name(name.clone()),
+                state,
+                config,
+              )?;
+            }
+
+            if args.next_active_workspace {
+              move_window_to_workspace(
+                window.clone(),
+                WorkspaceTarget::NextActive,
+                state,
+                config,
+              )?;
+            }
+
+            if args.prev_active_workspace {
+              move_window_to_workspace(
+                window.clone(),
+                WorkspaceTarget::PreviousActive,
+                state,
+                config,
+              )?;
+            }
+
+            if args.next_workspace {
+              move_window_to_workspace(
+                window.clone(),
+                WorkspaceTarget::Next,
+                state,
+                config,
+              )?;
+            }
+
+            if args.prev_workspace {
+              move_window_to_workspace(
+                window.clone(),
+                WorkspaceTarget::Previous,
+                state,
+                config,
+              )?;
+            }
+
+            if args.recent_workspace {
+              move_window_to_workspace(
+                window.clone(),
+                WorkspaceTarget::Recent,
+                state,
+                config,
+              )?;
+            }
+
+            if args.next_active_workspace_on_monitor {
+              move_window_to_workspace(
+                window.clone(),
+                WorkspaceTarget::NextActiveInMonitor,
+                state,
+                config,
+              )?;
+            }
+
+            if args.prev_active_workspace_on_monitor {
+              move_window_to_workspace(
+                window,
+                WorkspaceTarget::PreviousActiveInMonitor,
+                state,
+                config,
+              )?;
+            }
+            Ok(())
+          }
+
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::MoveWorkspace { direction } => {
+        let workspace =
+          subject_container.workspace().context("No workspace.")?;
+
+        move_workspace_in_direction(&workspace, direction, state, config)
+      }
+      InvokeCommand::Position(args) => {
+        match subject_container.as_window_container() {
+          Ok(window) => {
+            if args.centered {
+              set_window_position(
+                window,
+                &WindowPositionTarget::Centered,
+                state,
+              )
+            } else {
+              set_window_position(
+                window,
+                &WindowPositionTarget::Coordinates(args.x_pos, args.y_pos),
+                state,
+              )
+            }
+          }
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::UpdateWorkspaceConfig {
+        workspace,
+        new_config,
+      } => {
+        let workspace = if let Some(workspace_name) = workspace {
+          state
+            .workspace_by_name(workspace_name)
+            .context("Workspace doesn't exist.")?
+        } else {
+          subject_container.workspace().context("No workspace.")?
+        };
+        update_workspace_config(&workspace, state, config, new_config)
+      }
+      InvokeCommand::Resize(args) => {
+        match subject_container.as_window_container() {
+          Ok(window) => resize_window(
+            &window,
+            args.width.clone(),
+            args.height.clone(),
+            state,
+          ),
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::SetFloating {
+        centered,
+        shown_on_top,
+        x_pos,
+        y_pos,
+        width,
+        height,
+      } => match subject_container.as_window_container() {
+        Ok(window) => {
+          let floating_defaults =
+            &config.value.window_behavior.state_defaults.floating;
+          let centered = centered.unwrap_or(floating_defaults.centered);
+
+          let window = update_window_state(
+            window.clone(),
+            WindowState::Floating(FloatingStateConfig {
+              centered,
+              shown_on_top: shown_on_top
+                .unwrap_or(floating_defaults.shown_on_top),
+            }),
+            state,
+            config,
+          )?;
+
+          // Allow size and position to be set if window has not previously
+          // been manually placed.
+          if !window.has_custom_floating_placement() {
+            if width.is_some() || height.is_some() {
+              set_window_size(
+                window.clone(),
+                width.clone(),
+                height.clone(),
+                state,
+              )?;
+            }
+
+            if centered {
+              set_window_position(
+                window,
+                &WindowPositionTarget::Centered,
+                state,
+              )?;
+            } else if x_pos.is_some() || y_pos.is_some() {
+              set_window_position(
+                window,
+                &WindowPositionTarget::Coordinates(*x_pos, *y_pos),
+                state,
+              )?;
+            }
+          }
+
+          Ok(())
+        }
+        _ => Ok(()),
+      },
+      InvokeCommand::SetFullscreen {
+        maximized,
+        shown_on_top,
+      } => match subject_container.as_window_container() {
+        Ok(window) => {
+          let fullscreen_defaults =
+            &config.value.window_behavior.state_defaults.fullscreen;
+
+          update_window_state(
+            window.clone(),
+            WindowState::Fullscreen(FullscreenStateConfig {
+              maximized: maximized
+                .unwrap_or(fullscreen_defaults.maximized),
+              shown_on_top: shown_on_top
+                .unwrap_or(fullscreen_defaults.shown_on_top),
+            }),
+            state,
+            config,
+          )?;
+
+          Ok(())
+        }
+        _ => Ok(()),
+      },
+      InvokeCommand::SetMinimized => {
+        match subject_container.as_window_container() {
+          Ok(window) => {
+            update_window_state(
+              window.clone(),
+              WindowState::Minimized,
+              state,
+              config,
+            )?;
+
+            Ok(())
+          }
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::SetTiling => {
+        match subject_container.as_window_container() {
+          Ok(window) => {
+            update_window_state(
+              window,
+              WindowState::Tiling,
+              state,
+              config,
+            )?;
+
+            Ok(())
+          }
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::SetTitleBarVisibility {
+        // LINT: `visibility` is only used on Windows.
+        #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+        visibility,
+      } => match subject_container.as_window_container() {
+        #[cfg(target_os = "windows")]
+        Ok(window) => {
+          _ = window.native().set_title_bar_visibility(
+            *visibility == TitleBarVisibility::Shown,
+          );
+          Ok(())
+        }
+        _ => Ok(()),
+      },
+      // LINT: `args` is only used on Windows.
+      #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+      InvokeCommand::SetTransparency(args) => {
+        match subject_container.as_window_container() {
+          #[cfg(target_os = "windows")]
+          Ok(window) => {
+            if let Some(opacity) = &args.opacity {
+              _ = window.native().set_transparency(opacity);
+            }
+
+            if let Some(opacity_delta) = &args.opacity_delta {
+              _ = window.native().adjust_transparency(opacity_delta);
+            }
+
+            Ok(())
+          }
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::ShellExec {
+        hide_window,
+        command,
+      } => shell_exec(&command.join(" "), *hide_window, state),
+      InvokeCommand::Size(args) => {
+        match subject_container.as_window_container() {
+          Ok(window) => set_window_size(
+            window,
+            args.width.clone(),
+            args.height.clone(),
+            state,
+          ),
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::ToggleFloating {
+        centered,
+        shown_on_top,
+      } => match subject_container.as_window_container() {
+        Ok(window) => {
+          let floating_defaults =
+            &config.value.window_behavior.state_defaults.floating;
+
+          let centered = centered.unwrap_or(floating_defaults.centered);
+          let target_state = WindowState::Floating(FloatingStateConfig {
+            centered,
+            shown_on_top: shown_on_top
+              .unwrap_or(floating_defaults.shown_on_top),
+          });
+
+          let window = update_window_state(
+            window.clone(),
+            window.toggled_state(target_state, config),
+            state,
+            config,
+          )?;
+
+          if !window.has_custom_floating_placement() && centered {
+            set_window_position(
+              window,
+              &WindowPositionTarget::Centered,
+              state,
+            )?;
+          }
+
+          Ok(())
+        }
+        _ => Ok(()),
+      },
+      InvokeCommand::ToggleFullscreen {
+        maximized,
+        shown_on_top,
+      } => match subject_container.as_window_container() {
+        Ok(window) => {
+          let fullscreen_defaults =
+            &config.value.window_behavior.state_defaults.fullscreen;
+
+          let target_state =
+            WindowState::Fullscreen(FullscreenStateConfig {
+              maximized: maximized
+                .unwrap_or(fullscreen_defaults.maximized),
+              shown_on_top: shown_on_top
+                .unwrap_or(fullscreen_defaults.shown_on_top),
+            });
+
+          update_window_state(
+            window.clone(),
+            window.toggled_state(target_state, config),
+            state,
+            config,
+          )?;
+
+          Ok(())
+        }
+        _ => Ok(()),
+      },
+      InvokeCommand::ToggleMinimized => {
+        match subject_container.as_window_container() {
+          Ok(window) => {
+            update_window_state(
+              window.clone(),
+              window.toggled_state(WindowState::Minimized, config),
+              state,
+              config,
+            )?;
+
+            Ok(())
+          }
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::ToggleTiling => {
+        match subject_container.as_window_container() {
+          Ok(window) => {
+            update_window_state(
+              window.clone(),
+              window.toggled_state(WindowState::Tiling, config),
+              state,
+              config,
+            )?;
+
+            Ok(())
+          }
+          _ => Ok(()),
+        }
+      }
+      InvokeCommand::ToggleTilingDirection => {
+        toggle_tiling_direction(subject_container, state, config)
+      }
+      InvokeCommand::SetTilingDirection { tiling_direction } => {
+        set_tiling_direction(
+          subject_container,
+          state,
+          config,
+          tiling_direction,
+        )
+      }
+      InvokeCommand::WmCycleFocus {
+        omit_floating,
+        omit_fullscreen,
+        omit_minimized,
+        omit_tiling,
+      } => cycle_focus(
+        *omit_floating,
+        *omit_fullscreen,
+        *omit_minimized,
+        *omit_tiling,
+        state,
+        config,
+      ),
+      InvokeCommand::WmDisableBindingMode { name } => {
+        disable_binding_mode(name, state);
+        Ok(())
+      }
+      InvokeCommand::WmEnableBindingMode { name } => {
+        enable_binding_mode(name, state, config)
+      }
+      InvokeCommand::WmExit => state.emit_exit(),
+      InvokeCommand::WmRedraw => {
+        state
+          .pending_sync
+          .queue_container_to_redraw(state.root_container.clone());
+
+        Ok(())
+      }
+      InvokeCommand::WmReloadConfig => reload_config(state, config),
+      InvokeCommand::WmTogglePause => {
+        toggle_pause(state);
+        Ok(())
+      }
+    }
+  }
+
+  /// Runs cleanup tasks when the WM is exiting.
+  pub(crate) fn cleanup(
+    &mut self,
+    config: &mut UserConfig,
+    ipc_server: &mut IpcServer,
+  ) {
+    self.state.emit_event(WmEvent::ApplicationExiting);
+
+    // Ensure that the WM is unpaused, otherwise, shutdown commands won't
+    // get executed.
+    self.state.is_paused = false;
+
+    // Run user's shutdown commands.
+    if let Err(err) = self.process_commands(
+      &config.value.general.shutdown_commands.clone(),
+      None,
+      config,
+    ) {
+      tracing::warn!("Failed to run shutdown commands: {:?}", err);
+    }
+
+    // Emit remaining WM events before exiting.
+    while let Ok(wm_event) = self.event_rx.try_recv() {
+      tracing::info!(
+        "Emitting WM event before shutting down: {:?}",
+        wm_event
+      );
+
+      if let Err(err) = ipc_server.process_event(wm_event) {
+        tracing::warn!("{:?}", err);
+      }
+    }
+  }
+}
